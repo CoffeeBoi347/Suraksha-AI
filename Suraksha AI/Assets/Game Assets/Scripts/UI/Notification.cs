@@ -35,6 +35,7 @@ public class Notification : MonoBehaviour
         DontDestroyOnLoad(gameObject);
 
         _tweenerController = GetComponent<UITweenerController>();
+        _tweenerController.SetInactive();
     }
 
     private void Start()

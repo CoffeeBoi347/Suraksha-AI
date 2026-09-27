@@ -31,11 +31,16 @@ public class UITweenerController : MonoBehaviour
     private float _visibility;
 
     private bool _targetShown;
+    public bool _isNotif = false;
     public bool IsShown => _targetShown;
 
     void Awake()
     {
         EnsureReferences();
+
+        if (!_isNotif)
+            TryInit(false);
+
         _visibility = gameObject.activeSelf ? 1f : 0f;
         _targetShown = _visibility > 0f;
     }

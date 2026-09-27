@@ -9,6 +9,31 @@ namespace Suraksha.Auth
     {
         private readonly string baseUrl = "http://localhost:8000/auth";
 
+        public async Task<SignUpResponse> SignUpAsync(string email, string password, string fullName, string phoneNumber)
+        {
+            var requestData = new SignUpRequest
+            {
+                email = email,
+                password = password,
+                full_name = fullName,
+                phone_number = phoneNumber
+            };
+            string json = JsonUtility.ToJson(requestData);
+
+            using (UnityWebRequest req = CreatePostRequest($"{baseUrl}/signup", json))
+            {
+                var operation = req.SendWebRequest();
+                while (!operation.isDone) await Task.Yield();
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    throw new System.Exception($"Sign Up failed: {req.downloadHandler.text}");
+                }
+
+                return JsonUtility.FromJson<SignUpResponse>(req.downloadHandler.text);
+            }
+        }
+
         public async Task<LoginResponse> LoginAsync(string email, string password)
         {
             var requestData = new LoginRequest { email = email, password = password };
@@ -25,6 +50,24 @@ namespace Suraksha.Auth
                 }
 
                 return JsonUtility.FromJson<LoginResponse>(req.downloadHandler.text);
+            }
+        }
+
+        public async Task<bool> ForgotPasswordAsync(string email)
+        {
+            var requestData = new ForgotPasswordRequest { email = email };
+            string json = JsonUtility.ToJson(requestData);
+
+            using (UnityWebRequest req = CreatePostRequest($"{baseUrl}/forgot-password", json))
+            {
+                var operation = req.SendWebRequest();
+                while (!operation.isDone) await Task.Yield();
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    throw new System.Exception($"Forgot password failed: {req.downloadHandler.text}");
+                }
+                return true;
             }
         }
 
