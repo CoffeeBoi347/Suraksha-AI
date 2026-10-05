@@ -1,15 +1,18 @@
+using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace Suraksha.Auth
 {
     [RequireComponent(typeof(AuthView))]
     public class AuthController : MonoBehaviour
     {
+        private const int OtpResendCooldownSeconds = 60; 
+
         private AuthView authView;
         private AuthService authService;
 
-        [SerializeField] private UITweenerController _forgotPasswordPopup;
-        [SerializeField] private UITweenerController _signUpPopup;
+        private string _pendingPhoneNumber;
 
         private void Awake()
         {
@@ -17,11 +20,18 @@ namespace Suraksha.Auth
             authService = new AuthService();
         }
 
+        private async void Start()
+        {
+            await TryAutoLoginAsync();
+        }
+
         private void OnEnable()
         {
             authView.OnLoginClicked += HandleLogin;
             authView.OnForgotPasswordClicked += HandleForgotPassword;
             authView.OnSignUpClicked += HandleSignUp;
+            authView.OnPhoneOTPClicked += HandleVerifyOtp;
+            authView.OnResendOtpClicked += HandleResendOtp;
         }
 
         private void OnDisable()
@@ -29,6 +39,8 @@ namespace Suraksha.Auth
             authView.OnLoginClicked -= HandleLogin;
             authView.OnForgotPasswordClicked -= HandleForgotPassword;
             authView.OnSignUpClicked -= HandleSignUp;
+            authView.OnPhoneOTPClicked -= HandleVerifyOtp;
+            authView.OnResendOtpClicked -= HandleResendOtp;
         }
 
         public async void HandleSignUp(string email, string password, string fullName, string phoneNumber)
@@ -46,22 +58,104 @@ namespace Suraksha.Auth
             {
                 SignUpResponse response = await authService.SignUpAsync(email, password, fullName, phoneNumber);
 
-                PlayerPrefs.SetString("access_token", response.access_token);
-                PlayerPrefs.SetString("refresh_token", response.refresh_token);
+                if (!string.IsNullOrEmpty(response.access_token))
+                {
+                    PlayerPrefs.SetString("access_token", response.access_token);
+                    PlayerPrefs.SetString("refresh_token", response.refresh_token);
+                }
 
-                Notification.Instance.ShowMessage("Success", "Account created securely!");
-                _signUpPopup.SetInactive();
-
+                _pendingPhoneNumber = phoneNumber;
             }
             catch (System.Exception ex)
             {
                 Notification.Instance.ShowMessage("Error", "Could not create account. Check your details.");
                 Debug.LogError(ex.Message);
+                authView.SetInteractable(true);
+                return;
+            }
+
+            Notification.Instance.ShowMessage("Success", "Account created securely!");
+            authView.signUpPopup.SetInactive();
+
+            authView.OtpCleaned();
+            authView.SetOtpPhoneLabel(phoneNumber);
+            authView.phoneOTPPopup.Init();
+
+            try
+            {
+                await authService.RequestPhoneOtpAsync(phoneNumber);
+                authView.StartResendCooldown(OtpResendCooldownSeconds);
+            }
+            catch (System.Exception ex)
+            {
+                Notification.Instance.ShowMessage("Error", "Could not send code. Tap Resend to try again.");
+                Debug.LogError(ex.Message);
             }
             finally
             {
                 authView.SetInteractable(true);
-                _signUpPopup.SetInactive();
+            }
+        }
+
+        public async void HandleVerifyOtp(string otp)
+        {
+            if (string.IsNullOrWhiteSpace(otp))
+            {
+                Notification.Instance.ShowMessage("Warning", "Enter the code you received.");
+                return;
+            }
+            if (string.IsNullOrEmpty(_pendingPhoneNumber))
+            {
+                Notification.Instance.ShowMessage("Error", "No phone number pending verification.");
+                return;
+            }
+
+            authView.SetOtpInteractable(false);
+
+            try
+            {
+                await authService.VerifyPhoneOtpAsync(_pendingPhoneNumber, otp);
+
+                Notification.Instance.ShowMessage("Success", "Phone number verified!");
+                authView.phoneOTPPopup.SetInactive();
+                _pendingPhoneNumber = null;
+            }
+            catch (System.Exception ex)
+            {
+                Notification.Instance.ShowMessage("Error", "Incorrect or expired code. Try again.");
+                Debug.LogError(ex.Message);
+            }
+            finally
+            {
+                authView.SetOtpInteractable(true);
+                authView.OtpCleaned();
+            }
+        }
+
+        public async void HandleResendOtp()
+        {
+            if (string.IsNullOrEmpty(_pendingPhoneNumber))
+            {
+                Notification.Instance.ShowMessage("Error", "No phone number pending verification.");
+                return;
+            }
+
+            authView.SetOtpInteractable(false);
+
+            try
+            {
+                await authService.RequestPhoneOtpAsync(_pendingPhoneNumber);
+                Notification.Instance.ShowMessage("Success", "New code sent.");
+                authView.StartResendCooldown(OtpResendCooldownSeconds);
+            }
+            catch (System.Exception ex)
+            {
+                Notification.Instance.ShowMessage("Error", "Could not resend code yet, wait a moment.");
+                Debug.LogError(ex.Message);
+            }
+            finally
+            {
+                authView.SetOtpInteractable(true);
             }
         }
 
@@ -77,21 +171,23 @@ namespace Suraksha.Auth
 
             try
             {
-                LoginResponse response = await authService.LoginAsync(email, password);
+                LoginResponse response = await authService.LoginAsync(email, 
+                    password, 
+                    onSuccess: response => authView._loading.Init(),
+                    onError: error => Notification.Instance.ShowMessage("Warning", $"{error}")
+                );
 
                 PlayerPrefs.SetString("access_token", response.access_token);
                 PlayerPrefs.SetString("refresh_token", response.refresh_token);
 
                 Notification.Instance.ShowMessage("Success", $"Welcome back, {response.full_name}!");
+
+                await LoadMainSceneAsync();
             }
             catch (System.Exception ex)
             {
                 Notification.Instance.ShowMessage("Error", "Invalid email or password.");
                 Debug.LogError(ex.Message);
-            }
-            finally
-            {
-                authView.SetInteractable(true);
             }
         }
 
@@ -109,9 +205,8 @@ namespace Suraksha.Auth
             {
                 await authService.ForgotPasswordAsync(email);
                 Notification.Instance.ShowMessage("Success", "Reset link sent to your email.");
-                _forgotPasswordPopup.SetInactive();
+                authView.forgotPasswordPopup.SetInactive();
             }
-
             catch (System.Exception ex)
             {
                 Notification.Instance.ShowMessage("Error", "Failed to send reset link. Try again.");
@@ -120,11 +215,58 @@ namespace Suraksha.Auth
             finally
             {
                 authView.SetInteractable(true);
-                _forgotPasswordPopup.SetInactive();
             }
         }
 
-        public void OpenForgotPassword() { authView.ResetPasswordCleaned();  _forgotPasswordPopup.Show(); }
-        public void OpenSignUp() { authView.SignUpCleaned();  _signUpPopup.Show(); }
+        private async Task TryAutoLoginAsync()
+        {
+            if (!PlayerPrefs.HasKey("access_token"))
+                return;
+
+            authView.SetInteractable(false);
+
+            try
+            {
+                bool isValid = await authService.ValidateSessionAsync();
+
+                if (isValid)
+                {
+                    await LoadMainSceneAsync();
+                    return;
+                }
+
+                PlayerPrefs.DeleteKey("access_token");
+                PlayerPrefs.DeleteKey("refresh_token");
+                PlayerPrefs.Save();
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"Auto-login failed: {ex.Message}");
+            }
+            finally
+            {
+                authView.SetInteractable(true);
+            }
+        }
+
+        private async Task LoadMainSceneAsync()
+        {
+            const string sceneName = "MainScene";
+
+            AsyncOperation operation =
+                SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Single);
+
+            if (operation == null)
+            {
+                throw new System.Exception(
+                    $"Could not start loading scene: {sceneName}"
+                );
+            }
+
+            while (!operation.isDone)
+            {
+                await Task.Yield();
+            }
+        }
     }
 }
