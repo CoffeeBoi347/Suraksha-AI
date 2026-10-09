@@ -19,6 +19,18 @@ namespace Suraksha.Auth
             }
         }
 
+        public void SignOut()
+        {
+            AccessToken = null;
+
+            PlayerPrefs.DeleteKey("access_token");
+            PlayerPrefs.DeleteKey("refresh_token");
+
+            PlayerPrefs.Save();
+
+            Debug.Log("[Auth] User signed out.");
+        }
+
         public async Task<SignUpResponse> SignUpAsync(string email, string password, string fullName, string phoneNumber)
         {
             var requestData = new SignUpRequest

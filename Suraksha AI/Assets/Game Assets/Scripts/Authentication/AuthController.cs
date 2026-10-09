@@ -7,12 +7,17 @@ namespace Suraksha.Auth
     [RequireComponent(typeof(AuthView))]
     public class AuthController : MonoBehaviour
     {
-        private const int OtpResendCooldownSeconds = 60; 
+        private const int OtpResendCooldownSeconds = 60;
 
         private AuthView authView;
         private AuthService authService;
 
+        // Held in memory ONLY until the account is verified. Never touch PlayerPrefs before that,
+        // or auto-login will skip OTP on the next launch.
         private string _pendingPhoneNumber;
+        private string _pendingEmail;
+        private string _pendingAccessToken;
+        private string _pendingRefreshToken;
 
         private void Awake()
         {
@@ -43,6 +48,51 @@ namespace Suraksha.Auth
             authView.OnResendOtpClicked -= HandleResendOtp;
         }
 
+        private void SaveSession(string access, string refresh)
+        {
+            PlayerPrefs.SetString("access_token", access);
+            PlayerPrefs.SetString("refresh_token", refresh);
+            PlayerPrefs.Save();
+        }
+
+        private void ClearSession()
+        {
+            PlayerPrefs.DeleteKey("access_token");
+            PlayerPrefs.DeleteKey("refresh_token");
+            PlayerPrefs.Save();
+        }
+
+        private void ClearPending()
+        {
+            _pendingPhoneNumber = null;
+            _pendingEmail = null;
+            _pendingAccessToken = null;
+            _pendingRefreshToken = null;
+        }
+
+        // OTP is looked up by phone number on the server and delivered to the account's email.
+        private async Task StartPhoneVerificationAsync(string phoneNumber, string email)
+        {
+            _pendingPhoneNumber = phoneNumber;
+            _pendingEmail = email;
+
+            authView.OtpCleaned();
+            authView.SetOtpPhoneLabel(email);   // popup label reads "Code sent to <email>"
+            authView.phoneOTPPopup.Init();
+
+            try
+            {
+                await authService.RequestPhoneOtpAsync(phoneNumber);
+                authView.StartResendCooldown(OtpResendCooldownSeconds);
+                Notification.Instance.ShowMessage("Success", $"Verification code sent to {email}");
+            }
+            catch (System.Exception ex)
+            {
+                Notification.Instance.ShowMessage("Error", "Could not send code. Tap Resend to try again.");
+                Debug.LogError(ex.Message);
+            }
+        }
+
         public async void HandleSignUp(string email, string password, string fullName, string phoneNumber)
         {
             if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password) ||
@@ -58,13 +108,10 @@ namespace Suraksha.Auth
             {
                 SignUpResponse response = await authService.SignUpAsync(email, password, fullName, phoneNumber);
 
-                if (!string.IsNullOrEmpty(response.access_token))
-                {
-                    PlayerPrefs.SetString("access_token", response.access_token);
-                    PlayerPrefs.SetString("refresh_token", response.refresh_token);
-                }
-
-                _pendingPhoneNumber = phoneNumber;
+                // NOT saved to PlayerPrefs yet: only after the OTP is verified
+                _pendingAccessToken = response.access_token;
+                _pendingRefreshToken = response.refresh_token;
+                ClearSession(); // wipe any stale session from earlier tests
             }
             catch (System.Exception ex)
             {
@@ -74,22 +121,11 @@ namespace Suraksha.Auth
                 return;
             }
 
-            Notification.Instance.ShowMessage("Success", "Account created securely!");
             authView.signUpPopup.SetInactive();
-
-            authView.OtpCleaned();
-            authView.SetOtpPhoneLabel(phoneNumber);
-            authView.phoneOTPPopup.Init();
 
             try
             {
-                await authService.RequestPhoneOtpAsync(phoneNumber);
-                authView.StartResendCooldown(OtpResendCooldownSeconds);
-            }
-            catch (System.Exception ex)
-            {
-                Notification.Instance.ShowMessage("Error", "Could not send code. Tap Resend to try again.");
-                Debug.LogError(ex.Message);
+                await StartPhoneVerificationAsync(phoneNumber, email.Trim());
             }
             finally
             {
@@ -106,19 +142,17 @@ namespace Suraksha.Auth
             }
             if (string.IsNullOrEmpty(_pendingPhoneNumber))
             {
-                Notification.Instance.ShowMessage("Error", "No phone number pending verification.");
+                Notification.Instance.ShowMessage("Error", "Nothing pending verification.");
                 return;
             }
 
             authView.SetOtpInteractable(false);
 
+            bool verified = false;
             try
             {
                 await authService.VerifyPhoneOtpAsync(_pendingPhoneNumber, otp);
-
-                Notification.Instance.ShowMessage("Success", "Phone number verified!");
-                authView.phoneOTPPopup.SetInactive();
-                _pendingPhoneNumber = null;
+                verified = true;
             }
             catch (System.Exception ex)
             {
@@ -130,13 +164,27 @@ namespace Suraksha.Auth
                 authView.SetOtpInteractable(true);
                 authView.OtpCleaned();
             }
+
+            if (!verified) return;
+
+            Notification.Instance.ShowMessage("Success", "Account verified!");
+            authView.phoneOTPPopup.SetInactive();
+
+            // Verified: NOW it's safe to persist the session
+            bool hasSession = !string.IsNullOrEmpty(_pendingAccessToken);
+            if (hasSession)
+                SaveSession(_pendingAccessToken, _pendingRefreshToken);
+            ClearPending();
+
+            if (hasSession)
+                await LoadMainSceneAsync();
         }
 
         public async void HandleResendOtp()
         {
             if (string.IsNullOrEmpty(_pendingPhoneNumber))
             {
-                Notification.Instance.ShowMessage("Error", "No phone number pending verification.");
+                Notification.Instance.ShowMessage("Error", "Nothing pending verification.");
                 return;
             }
 
@@ -145,7 +193,7 @@ namespace Suraksha.Auth
             try
             {
                 await authService.RequestPhoneOtpAsync(_pendingPhoneNumber);
-                Notification.Instance.ShowMessage("Success", "New code sent.");
+                Notification.Instance.ShowMessage("Success", $"New code sent to {_pendingEmail}");
                 authView.StartResendCooldown(OtpResendCooldownSeconds);
             }
             catch (System.Exception ex)
@@ -171,14 +219,27 @@ namespace Suraksha.Auth
 
             try
             {
-                LoginResponse response = await authService.LoginAsync(email, 
-                    password, 
+                LoginResponse response = await authService.LoginAsync(email,
+                    password,
                     onSuccess: response => authView._loading.Init(),
                     onError: error => Notification.Instance.ShowMessage("Warning", $"{error}")
                 );
 
-                PlayerPrefs.SetString("access_token", response.access_token);
-                PlayerPrefs.SetString("refresh_token", response.refresh_token);
+                if (!response.phone_verified)
+                {
+                    authView._loading.SetInactive();   // onSuccess already showed the loading screen
+
+                    _pendingAccessToken = response.access_token;
+                    _pendingRefreshToken = response.refresh_token;
+                    ClearSession();
+
+                    Notification.Instance.ShowMessage("Warning", "Verify your account to continue.");
+                    await StartPhoneVerificationAsync(response.phone_number, email.Trim());
+                    authView.SetInteractable(true);
+                    return;
+                }
+
+                SaveSession(response.access_token, response.refresh_token);
 
                 Notification.Instance.ShowMessage("Success", $"Welcome back, {response.full_name}!");
 
@@ -188,6 +249,7 @@ namespace Suraksha.Auth
             {
                 Notification.Instance.ShowMessage("Error", "Invalid email or password.");
                 Debug.LogError(ex.Message);
+                authView.SetInteractable(true);
             }
         }
 
@@ -235,9 +297,7 @@ namespace Suraksha.Auth
                     return;
                 }
 
-                PlayerPrefs.DeleteKey("access_token");
-                PlayerPrefs.DeleteKey("refresh_token");
-                PlayerPrefs.Save();
+                ClearSession();
             }
             catch (System.Exception ex)
             {

@@ -59,6 +59,7 @@ namespace Suraksha.Auth
         public string user_id;
         public string full_name;
         public string phone_number;
+        public bool phone_verified;
     }
 
     [Serializable]

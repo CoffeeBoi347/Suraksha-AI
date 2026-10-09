@@ -1,4 +1,5 @@
 using NativeWebSocket;
+using Suraksha.Sos;
 using System;
 using System.Text;
 using System.Threading.Tasks;
@@ -23,6 +24,8 @@ public class WebSocketClient : MonoBehaviour
     private bool _isConnecting;
     private bool _hasReceivedFirstFrame;
     private bool _isShuttingDown;
+    private bool _reconnectAfterClose;
+    private float _lastManualSosTime = -999f;
 
     public bool isConnected =>
         _webSocket != null &&
@@ -32,6 +35,9 @@ public class WebSocketClient : MonoBehaviour
     [SerializeField] private Loading _loading;
     [SerializeField] private WebcamCapture _cameraCapture;
     [SerializeField] private BoundingBoxOverlay _boundingBoxOverlay;
+    [SerializeField] private EmergencyPopup _emergencyPopup;
+
+    public event Action<AlertMessage> OnAlert;
 
     private void Start()
     {
@@ -48,25 +54,59 @@ public class WebSocketClient : MonoBehaviour
         }
 
         if (_boundingBoxOverlay == null)
-        {
-            Debug.LogWarning(
-                "[Vision] BoundingBoxOverlay reference is missing."
-            );
-        }
+            Debug.LogWarning("[Vision] BoundingBoxOverlay reference is missing.");
+
+        if (_emergencyPopup == null)
+            Debug.LogWarning("[Vision] EmergencyPopup reference is missing: the SOS popup will never open.");
+        else
+            _emergencyPopup.SendToServer = SendJson;   // Send / Cancel / countdown timeout go out over this socket.
 
         _ = Connect();
     }
 
-    public event Action<AlertMessage> OnAlert;
-
-    public void SendJson(string json)
+    // Returns true only if the message went out on an open socket.
+    public bool SendJson(string json)
     {
-        if (!isConnected) return;
-        _ = _webSocket.SendText(json);
+        if (!isConnected)
+        {
+            Debug.LogWarning($"[Vision] Not connected, dropped: {json}");
+            return false;
+        }
+
+        _ = SendTextSafe(json);
+        return true;
+    }
+
+    private async Task SendTextSafe(string json)
+    {
+        try
+        {
+            await _webSocket.SendText(json);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[Vision] Failed to send text: {ex.Message}\n{json}");
+        }
     }
 
     public void SendCancelSOS() => SendJson("{\"type\":\"cancel_sos\"}");
-    public void SendManualSOS() => SendJson("{\"type\":\"manual_sos\"}");
+    public void SendManualSOS()
+    {
+        // Client-side debounce: the server also limits manual SOS, this just stops double-taps.
+        if (Time.unscaledTime - _lastManualSosTime < 3f)
+            return;
+        _lastManualSosTime = Time.unscaledTime;
+        SendJson("{\"type\":\"manual_sos\"}");
+    }
+
+    // Dev only. Needs SOS_TEST_POPUP=1 in the backend .env. In Play mode: right-click this component > Test SOS Popup.
+    // Press Cancel in the popup when testing: Send is a REAL SOS.
+    [ContextMenu("Test SOS Popup")]
+    public void SendTestPopup() => SendJson("{\"type\":\"test_popup\"}");
+
+    public void SendFalseAlarm() => SendJson("{\"type\":\"feedback\",\"label\":\"false_alarm\"}");
+    public void SendRealThreat() => SendJson("{\"type\":\"feedback\",\"label\":\"real_threat\"}");
+    public void SendUnsure() => SendJson("{\"type\":\"feedback\",\"label\":\"unsure\"}");
 
     public async Task Connect()
     {
@@ -90,8 +130,7 @@ public class WebSocketClient : MonoBehaviour
         try
         {
             string url = Constants.SOCKET_URL + Constants.MAIN_TYPE + "?hfov=65";
-
-            Debug.Log("[Vision] Connecting to backend...");
+            Debug.Log($"[Vision] Connecting to {url}");
 
             var headers = new Dictionary<string, string> { { "Authorization", "Bearer " + token } };
             var socket = new WebSocket(url, headers);
@@ -104,7 +143,6 @@ public class WebSocketClient : MonoBehaviour
 
                 Debug.Log("[Vision] WebSocket connected.");
                 _isConnecting = false;
-
                 SetLoading("Connected. Starting AI vision...");
             };
 
@@ -115,7 +153,6 @@ public class WebSocketClient : MonoBehaviour
 
                 Debug.LogError($"[Vision] WebSocket error: {error}");
                 _isConnecting = false;
-
                 SetLoading("Connection error. Please try again.");
             };
 
@@ -127,7 +164,12 @@ public class WebSocketClient : MonoBehaviour
                 Debug.Log($"[Vision] WebSocket closed: {code}");
                 _isConnecting = false;
 
-                if (!_isShuttingDown)
+                if (_reconnectAfterClose && !_isShuttingDown)
+                {
+                    _reconnectAfterClose = false;
+                    _ = ReconnectSoon();
+                }
+                else if (!_isShuttingDown)
                     SetLoading("Connection lost. Please reconnect.");
             };
 
@@ -144,13 +186,16 @@ public class WebSocketClient : MonoBehaviour
         catch (Exception ex)
         {
             _isConnecting = false;
-
-            Debug.LogError(
-                $"[Vision] Connection failed: {ex.Message}"
-            );
-
+            Debug.LogError($"[Vision] Connection failed: {ex.Message}");
             SetLoading("Unable to connect. Please try again.");
         }
+    }
+
+    private async Task ReconnectSoon()
+    {
+        await Task.Delay(1000);
+        if (!_isShuttingDown)
+            await Connect();
     }
 
     private void HandleMessage(byte[] data)
@@ -159,38 +204,25 @@ public class WebSocketClient : MonoBehaviour
 
         try
         {
-            DataPayload payload =
-                JsonUtility.FromJson<DataPayload>(message);
+            DataPayload payload = JsonUtility.FromJson<DataPayload>(message);
 
             if (payload == null)
             {
-                Debug.LogWarning(
-                    "[Vision] Empty or invalid JSON response."
-                );
+                Debug.LogWarning("[Vision] Empty or invalid JSON response.");
                 return;
             }
 
-            // Process AI frame responses.
             if (payload.type == "frame")
             {
                 if (!_hasReceivedFirstFrame)
                 {
                     _hasReceivedFirstFrame = true;
-
                     Debug.Log("[Vision] First AI frame received.");
-
                     SetLoadingVisible(false);
                 }
 
-                int targetCount = payload.targets?.Count ?? 0;
-
-                Debug.Log($"[Vision] Targets: {targetCount}");
-
-                // UPDATE THE BOUNDING BOXES AND LABELS.
                 if (_boundingBoxOverlay != null)
-                {
                     _boundingBoxOverlay.UpdateBoxes(payload.targets);
-                }
 
                 if (payload.targets == null)
                     return;
@@ -205,20 +237,32 @@ public class WebSocketClient : MonoBehaviour
                         $"Distance: {target.distance_m}m | {target.threat_reasoning}"
                     );
                 }
+                return;
             }
-            else
+
+            // Server ended a long session on purpose: reconnect quietly.
+            if (payload.type == "session_limit")
             {
-                AlertMessage alert = JsonUtility.FromJson<AlertMessage>(message);
-                Debug.Log($"[Vision] Event: {payload.type} | {alert?.unity_instruction}");
-                OnAlert?.Invoke(alert);
+                Debug.Log("[Vision] Session limit reached, reconnecting.");
+                _reconnectAfterClose = true;
+                return;
             }
+
+            // SOS messages: sos_prompt opens the popup; sos_fired / sos_failed / sos_cancelled / sos_already_sent close it.
+            if (payload.type != null && payload.type.StartsWith("sos_"))
+            {
+                Debug.Log($"[Vision] SOS message: {message}");
+                if (_emergencyPopup != null && _emergencyPopup.TryHandle(message))
+                    return;
+            }
+
+            AlertMessage alert = JsonUtility.FromJson<AlertMessage>(message);
+            Debug.Log($"[Vision] Event: {payload.type} | {alert?.unity_instruction}");
+            OnAlert?.Invoke(alert);
         }
         catch (Exception ex)
         {
-            Debug.LogError(
-                $"[Vision] Failed to parse message: " +
-                $"{ex.Message}\n{message}"
-            );
+            Debug.LogError($"[Vision] Failed to parse message: {ex.Message}\n{message}");
         }
     }
 
@@ -253,9 +297,7 @@ public class WebSocketClient : MonoBehaviour
         }
         catch (Exception ex)
         {
-            Debug.LogError(
-                $"[Vision] Failed to send frame: {ex.Message}"
-            );
+            Debug.LogError($"[Vision] Failed to send frame: {ex.Message}");
         }
     }
 
@@ -273,10 +315,8 @@ public class WebSocketClient : MonoBehaviour
         if (_loading == null)
             return;
 
-        if (visible)
-            _loading.Show();
-        else
-            _loading.Close();
+        if (visible) _loading.Show();
+        else _loading.Close();
     }
 
     public async Task Disconnect()
@@ -290,11 +330,8 @@ public class WebSocketClient : MonoBehaviour
         _isConnecting = false;
         _hasReceivedFirstFrame = false;
 
-        // Clear stale boxes when disconnecting.
         if (_boundingBoxOverlay != null)
-        {
             _boundingBoxOverlay.ClearBoxes();
-        }
 
         try
         {
@@ -302,15 +339,9 @@ public class WebSocketClient : MonoBehaviour
         }
         catch (Exception ex)
         {
-            Debug.LogWarning(
-                $"[Vision] Disconnect error: {ex.Message}"
-            );
+            Debug.LogWarning($"[Vision] Disconnect error: {ex.Message}");
         }
     }
-
-    public void SendFalseAlarm() => SendJson("{\"type\":\"feedback\",\"label\":\"false_alarm\"}");
-    public void SendRealThreat() => SendJson("{\"type\":\"feedback\",\"label\":\"real_threat\"}");
-    public void SendUnsure() => SendJson("{\"type\":\"feedback\",\"label\":\"unsure\"}");
 
     private async void OnApplicationQuit()
     {
